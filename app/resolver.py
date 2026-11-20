@@ -390,14 +390,18 @@ def _tombstone_message(current_parts: list[str], component: str, node: Node) -> 
     mask = node.mask
     assert mask is not None
     full = _normalize_abs(current_parts + [component])
+    rebuild_note = (
+        "；父目录已由更高层重建，但未补回此条目" if node.inherited_from_shadow else ""
+    )
     if mask.reason == MaskReason.OPAQUE:
         return (
             f"路径在段 {component!r} 处不可见：{full} 被层 "
             f"[{mask.source.layer_index}] ({mask.source.digest}) 的 opaque 标记遮蔽"
-            f"（opaque 目录 {mask.opaque_dir}），下层同名条目不会出现在容器视图中"
+            f"（opaque 目录 {mask.opaque_dir}）{rebuild_note}，"
+            f"下层同名条目不会出现在容器视图中"
         )
     return (
         f"路径在段 {component!r} 处不可见：{full} 被层 "
-        f"[{mask.source.layer_index}] ({mask.source.digest}) 的 whiteout 标记遮蔽，"
-        f"下层同名条目不会出现在容器视图中"
+        f"[{mask.source.layer_index}] ({mask.source.digest}) 的 whiteout 标记遮蔽"
+        f"{rebuild_note}，下层同名条目不会出现在容器视图中"
     )

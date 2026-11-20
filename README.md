@@ -13,6 +13,9 @@ tar（层 blob 支持 gzip 或裸 tar）与容器内绝对路径，按「分层�
 | 普通目录/文件/符号链接 | 直接读取归档中的元数据，全程在内存树中处理，不落盘执行 |
 | whiteout（`.wh.名称`） | 仅遮蔽**下层**同名条目；同层在遮蔽之后新增的条目照常可见 |
 | opaque（`.wh..wh..opq`） | 遮蔽所在目录的全部**下层**子项；同层新增项照常可见 |
+| 目录遮蔽后重建 | 未补回的旧条目以墓碑继承进重建目录，仍指向最初让它消失的 whiteout/opaque 层 |
+| 条目反复遮蔽/重建 | 从未恢复的条目一直保留最初的遮蔽来源；恢复后又被遮蔽的条目指向再次遮蔽它的层 |
+| 从未出现且无遮蔽记录 | 按普通缺失处理（`masking=null`） |
 | 目录挂载 | 用卷内容整棵替换挂载点子树，旧子树保留为遮蔽证据 |
 | 符号链接 | 按挂载后的容器视图解析；相对链接以链接所在目录为基准，支持绝对/相对/`..` |
 | 链接成环 | 第二次解析到同一链接绝对路径即报 `symlink_loop`，返回完整链接链 |
@@ -30,7 +33,7 @@ app/
   models.py    Pydantic 请求/响应模型（驱动 Swagger）
   main.py      FastAPI 路由
 scripts/build_sample_oci.py  构造三层演示镜像
-tests/         41 个 pytest 用例（层语义/解析器/端到端 API/安全）
+tests/         58 个 pytest 用例（层语义/解析器/端到端 API/安全）
 ```
 
 ## 用 Docker Compose 启动
@@ -47,7 +50,7 @@ docker compose up --build
 
 ## 在 Swagger 里试查样例
 
-先生成样例镜像（三层，含 whiteout、opaque、相对/绝对符号链接与链接环）：
+先生成样例镜像（三层，含 whiteout、opaque、**目录遮蔽后重建**、相对/绝对符号链接与链接环）：
 
 ```bash
 python3 scripts/build_sample_oci.py samples/sample-oci.tar.gz
@@ -67,6 +70,14 @@ python3 scripts/build_sample_oci.py samples/sample-oci.tar.gz
 | `/etc/app/config.yaml` | found，来源层 1（覆盖了层 0） |
 | `/etc/app/secret.env` | not_found，层 1 whiteout 遮蔽（附层摘要） |
 | `/etc/app/legacy/old.conf` | not_found，层 2 opaque 遮蔽（附 opaque 目录） |
+| `/etc/app/plugins/a.conf` | found，层 1 whiteout 整目录、层 2 重建后补回 |
+| `/etc/app/plugins/new.conf` | found，层 2 重建目录时新增 |
+| `/etc/app/plugins/b.conf` | not_found，层 1 whiteout 遮蔽（重建未补回，仍指向层 1） |
+| `/etc/app/plugins/nested/deep.conf` | not_found，断在段 `nested`，层 1 whiteout 遮蔽 |
+| `/etc/app/plugins/never-existed.conf` | not_found，普通缺失，`masking=null` |
+| `/etc/app/plugin-link` | found，解析到重建目录 `/etc/app/plugins` |
+| `/etc/app/plugin-b-link` | not_found，链接展开到 `/etc/app/plugins/b.conf`，层 1 whiteout |
+| `/etc/app/legacy/sub/x.conf` | not_found，层 2 opaque 遮蔽子目录且重建未补回 |
 | `/etc/app/legacy/keep.txt` | found，层 2 opaque 同层新增，仍可见 |
 | `/etc/app/current` | found，相对符号链接解析到 `/etc/app/config.yaml` |
 | `/var/log/app.log` | found，绝对符号链接解析到 `/opt/app/bin/tool` |
@@ -74,6 +85,8 @@ python3 scripts/build_sample_oci.py samples/sample-oci.tar.gz
 | `/etc/app/missing.yaml` | not_found，普通缺失，`masking=null`，指出断裂段 |
 | 挂载 `/data` 后查 `/data/readme.txt` | not_found，遮蔽原因 `mount`，挂载点 `/data` |
 | 挂载 `/data` 后查 `/data/tls/cert.pem` | found，来源 `{"kind":"mount","mount_point":"/data"}` |
+| 挂载 `/etc/app/plugins` 后查 `/etc/app/plugins/a.conf` | found，来源 `{"kind":"mount","mount_point":"/etc/app/plugins"}` |
+| 挂载 `/etc/app/plugins` 后查 `/etc/app/plugins/b.conf` | not_found，遮蔽原因 `mount` |
 
 ### curl 等价调用
 
@@ -112,7 +125,7 @@ curl -F "archive=@samples/sample-oci.tar.gz" \
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt pytest httpx
-.venv/bin/python -I -m pytest          # 41 个用例
+.venv/bin/python -I -m pytest          # 58 个用例
 PYTHONPATH=. .venv/bin/python -I -m uvicorn app.main:app --port 8000
 ```
 

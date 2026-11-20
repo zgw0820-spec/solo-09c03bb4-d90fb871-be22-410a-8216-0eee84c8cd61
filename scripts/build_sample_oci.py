@@ -6,17 +6,29 @@
 层 0（底层）
   /etc/app/config.yaml          基础配置
   /etc/app/secret.env           下层密钥（层 1 用 whiteout 删除）
+  /etc/app/plugins/a.conf       插件目录（层 1 whiteout 整目录，层 2 重建后只补回 a.conf）
+  /etc/app/plugins/b.conf       层 2 重建时未补回：应仍报 whiteout 层 1
+  /etc/app/plugins/nested/deep.conf  未补回的子目录条目
   /etc/app/legacy/old.conf      遗留配置（层 2 用 opaque 整目录遮蔽）
+  /etc/app/legacy/sub/x.conf    层 1 新增的旧文件（层 2 opaque 遮蔽，重建 sub 时未补回）
   /etc/app/legacy/keep.txt      同层（层 2）opaque 之后新建，仍应可见
   /opt/app/bin/tool             普通文件
   /data/readme.txt              挂载点目录内的镜像文件（挂载后被遮蔽）
 层 1
   whiteout: /etc/app/secret.env
+  whiteout: /etc/app/plugins        （整目录遮蔽）
+  /etc/app/legacy/sub/x.conf    旧文件，之后被层 2 opaque 遮蔽且未补回
   /etc/app/config.yaml          同层新增覆盖（遮蔽后新增仍可见）
   /var/log/app.log -> /opt/app/bin/tool   绝对符号链接
 层 2
+  /etc/app/plugins/             重建被 whiteout 的目录
+  /etc/app/plugins/a.conf       补回的文件正常可见
+  /etc/app/plugins/new.conf     重建时新增
+  /etc/app/plugin-link -> plugins          指向重建目录的相对符号链接
+  /etc/app/plugin-b-link -> plugins/b.conf 展开后断在未补回的旧条目上
   opaque: /etc/app/legacy
   /etc/app/legacy/keep.txt      opaque 同层新增
+  /etc/app/legacy/sub/          重建被 opaque 遮蔽的子目录，但未补回 x.conf
   /etc/app/current -> config.yaml        相对符号链接
   /etc/app/loop/a -> ../loop/b           与 b 构成环
   /etc/app/loop/b -> ../loop/a
@@ -100,6 +112,11 @@ def build(output: Path) -> None:
             ("etc/app/", b"", 0),
             ("etc/app/config.yaml", b"base: true\nlog_level: info\n", 1),
             ("etc/app/secret.env", b"SECRET_TOKEN=lower-layer-value\n", 1),
+            ("etc/app/plugins/", b"", 0),
+            ("etc/app/plugins/a.conf", b"plugin-a-v0\n", 1),
+            ("etc/app/plugins/b.conf", b"plugin-b-v0\n", 1),
+            ("etc/app/plugins/nested/", b"", 0),
+            ("etc/app/plugins/nested/deep.conf", b"deep-v0\n", 1),
             ("etc/app/legacy/", b"", 0),
             ("etc/app/legacy/old.conf", b"old-config-should-be-opaqued\n", 1),
             ("opt/", b"", 0),
@@ -115,15 +132,24 @@ def build(output: Path) -> None:
     layer1_tar = _tar_bytes(
         [
             ("etc/app/.wh.secret.env", b"", 1),
+            ("etc/app/.wh.plugins", b"", 1),
+            ("etc/app/legacy/sub/", b"", 0),
+            ("etc/app/legacy/sub/x.conf", b"added-in-layer1\n", 1),
             ("etc/app/config.yaml", b"base: true\nlog_level: debug\noverride: layer1\n", 1),
             ("var/log/app.log", "/opt/app/bin/tool", 2),
         ]
     )
     layer2_tar = _tar_bytes(
         [
+            ("etc/app/plugins/", b"", 0),
+            ("etc/app/plugins/a.conf", b"plugin-a-restored\n", 1),
+            ("etc/app/plugins/new.conf", b"plugin-new-in-layer2\n", 1),
+            ("etc/app/plugin-link", "plugins", 2),
+            ("etc/app/plugin-b-link", "plugins/b.conf", 2),
             ("etc/app/legacy/", b"", 0),
             ("etc/app/legacy/.wh..wh..opq", b"", 1),
             ("etc/app/legacy/keep.txt", b"created-in-same-layer-after-opaque\n", 1),
+            ("etc/app/legacy/sub/", b"", 0),
             ("etc/app/current", "config.yaml", 2),
             ("etc/app/loop/", b"", 0),
             ("etc/app/loop/a", "../loop/b", 2),
@@ -158,8 +184,8 @@ def build(output: Path) -> None:
         "rootfs": {"type": "layers", "diff_ids": diff_ids},
         "history": [
             {"created": "2026-11-20T00:00:00Z", "comment": "base layer"},
-            {"created": "2026-11-20T00:01:00Z", "comment": "whiteout + override"},
-            {"created": "2026-11-20T00:02:00Z", "comment": "opaque + symlinks"},
+            {"created": "2026-11-20T00:01:00Z", "comment": "whiteouts + override"},
+            {"created": "2026-11-20T00:02:00Z", "comment": "directory rebuild + opaque + symlinks"},
         ],
     }
     config_digest = _add_blob(blobs, json.dumps(config, indent=2).encode())

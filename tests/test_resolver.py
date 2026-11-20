@@ -93,6 +93,23 @@ def test_symlink_loop_reported(merged_tree):
     assert "环" in result.message
 
 
+def test_symlink_expanded_into_rebuilt_dir_reports_whiteout(merged_tree):
+    """符号链接展开后断在重建目录未补回的条目上，要给出 whiteout 与层摘要。"""
+    result = resolve(merged_tree, "/etc/app/plugin-b-link")
+    assert result.status == ResolutionStatus.NOT_FOUND
+    assert result.failed_component == "b.conf"
+    assert result.resolved_prefix == "/etc/app/plugins"
+    assert result.resolved_path == "/etc/app/plugins/b.conf"
+    assert len(result.symlink_chain) == 1
+    assert result.symlink_chain[0].link_path == "/etc/app/plugin-b-link"
+    assert result.masking is not None
+    assert result.masking.reason == "whiteout"
+    assert result.masking.layer_index == 1
+    assert result.masking.digest.startswith("sha256:")
+    assert result.masking.diff_id.startswith("sha256:")
+    assert "whiteout" in result.message
+
+
 def test_symlink_to_missing_target(merged_tree):
     # 绝对符号链接 /var/log/app.log -> /opt/app/bin/tool 目标存在；
     # 这里构造链接目标路径末段缺失的场景：通过不存在的链接路径直接断在普通段
@@ -180,6 +197,71 @@ def test_multi_hop_symlink_chain(merged_tree, make_mount):
     assert result.resolved_path == "/data/real.txt"
     assert result.source.kind == "mount"
     assert [hop.link_path for hop in result.symlink_chain] == ["/data/alias"]
+
+
+def test_rebuilt_directory_unrestored_entry_reports_original_mask(merged_tree):
+    """whiteout 整目录后重建：没补回的旧配置要报最初遮掉它的层，而不是普通缺失。"""
+    lost = resolve(merged_tree, "/etc/app/plugins/b.conf")
+    assert lost.status == ResolutionStatus.NOT_FOUND
+    assert lost.failed_component == "b.conf"
+    assert lost.resolved_prefix == "/etc/app/plugins"
+    assert lost.masking is not None
+    assert lost.masking.reason == "whiteout"
+    assert lost.masking.layer_index == 1
+    assert lost.masking.digest.startswith("sha256:")
+    assert lost.masking.diff_id.startswith("sha256:")
+    assert "whiteout" in lost.message
+
+    deep = resolve(merged_tree, "/etc/app/plugins/nested/deep.conf")
+    assert deep.status == ResolutionStatus.NOT_FOUND
+    assert deep.failed_component == "nested"
+    assert deep.masking.reason == "whiteout"
+    assert deep.masking.layer_index == 1
+
+
+def test_rebuilt_directory_restored_file_is_found(merged_tree):
+    for path in (
+        "/etc/app/plugins/a.conf",  # 重建层补回
+        "/etc/app/plugins/new.conf",  # 重建层新增
+        "/etc/app/plugin-link",  # 指向重建目录的符号链接
+    ):
+        result = resolve(merged_tree, path)
+        assert result.status == ResolutionStatus.FOUND, path
+        assert result.source.layer_index == 2
+
+    assert resolve(merged_tree, "/etc/app/plugin-link").resolved_path == "/etc/app/plugins"
+    # 重建目录本身是目录，不是墓碑
+    assert resolve(merged_tree, "/etc/app/plugins").node_kind == "directory"
+
+
+def test_opaque_subdir_rebuilt_unrestored_entry(merged_tree):
+    result = resolve(merged_tree, "/etc/app/legacy/sub/x.conf")
+    assert result.status == ResolutionStatus.NOT_FOUND
+    assert result.failed_component == "x.conf"
+    assert result.masking.reason == "opaque"
+    assert result.masking.layer_index == 2
+    assert result.masking.opaque_directory == "/etc/app/legacy"
+
+
+def test_never_seen_entry_still_plain_missing(merged_tree):
+    result = resolve(merged_tree, "/etc/app/plugins/never-existed.conf")
+    assert result.status == ResolutionStatus.NOT_FOUND
+    assert result.masking is None
+    assert "不存在" in result.message
+
+
+def test_rebuilt_directory_resolution_after_mount(merged_tree, make_mount):
+    """路径按挂载后的视图解析：重建目录被卷替换后，报告挂载遮蔽。"""
+    make_mount(merged_tree, "/etc/app/plugins", ["a.conf"])
+    restored = resolve(merged_tree, "/etc/app/plugins/a.conf")
+    assert restored.status == ResolutionStatus.FOUND
+    assert restored.source.kind == "mount"
+
+    hidden = resolve(merged_tree, "/etc/app/plugins/b.conf")
+    assert hidden.status == ResolutionStatus.NOT_FOUND
+    assert hidden.masking is not None
+    assert hidden.masking.reason == "mount"
+    assert hidden.masking.mount_point == "/etc/app/plugins"
 
 
 def test_symlink_chain_survives_root_reset(merged_tree):

@@ -71,6 +71,58 @@ def test_diagnose_same_layer_addition_after_opaque(client, sample_archive):
     assert body["source"]["layer_index"] == 2
 
 
+def test_diagnose_rebuilt_directory_unrestored_entry(client, sample_archive):
+    """whiteout 整目录后重建：没补回的旧配置报 whiteout 而不是普通缺失。"""
+    resp = _upload(client, sample_archive, "/etc/app/plugins/b.conf")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "not_found"
+    failure = body["failure"]
+    assert failure["failed_component"] == "b.conf"
+    assert failure["resolved_prefix"] == "/etc/app/plugins"
+    assert failure["masking"]["reason"] == "whiteout"
+    assert failure["masking"]["layer_index"] == 1
+    assert failure["masking"]["digest"].startswith("sha256:")
+    assert failure["masking"]["diff_id"].startswith("sha256:")
+
+    # 未补回的子目录条目同样保留最初遮蔽来源
+    deep = _upload(client, sample_archive, "/etc/app/plugins/nested/deep.conf").json()
+    assert deep["status"] == "not_found"
+    assert deep["failure"]["masking"]["reason"] == "whiteout"
+    assert deep["failure"]["masking"]["layer_index"] == 1
+
+
+def test_diagnose_rebuilt_directory_restored_entries(client, sample_archive):
+    for path in (
+        "/etc/app/plugins/a.conf",
+        "/etc/app/plugins/new.conf",
+        "/etc/app/plugin-link",
+    ):
+        body = _upload(client, sample_archive, path).json()
+        assert body["status"] == "found", path
+        assert body["source"]["kind"] == "layer"
+        assert body["source"]["layer_index"] == 2
+
+    link = _upload(client, sample_archive, "/etc/app/plugin-link").json()
+    assert link["resolved_path"] == "/etc/app/plugins"
+
+    never = _upload(client, sample_archive, "/etc/app/plugins/never-existed.conf").json()
+    assert never["status"] == "not_found"
+    assert never["failure"]["masking"] is None
+
+
+def test_diagnose_rebuilt_directory_with_mount(client, sample_archive):
+    mounts = [{"mount_point": "/etc/app/plugins", "volume_files": ["a.conf"]}]
+    body = _upload(client, sample_archive, "/etc/app/plugins/a.conf", mounts).json()
+    assert body["status"] == "found"
+    assert body["source"] == {"kind": "mount", "mount_point": "/etc/app/plugins"}
+
+    hidden = _upload(client, sample_archive, "/etc/app/plugins/b.conf", mounts).json()
+    assert hidden["status"] == "not_found"
+    assert hidden["failure"]["masking"]["reason"] == "mount"
+    assert hidden["failure"]["masking"]["mount_point"] == "/etc/app/plugins"
+
+
 def test_diagnose_symlink_chain(client, sample_archive):
     resp = _upload(client, sample_archive, "/etc/app/current")
     body = resp.json()
@@ -86,6 +138,28 @@ def test_diagnose_symlink_loop(client, sample_archive):
     assert body["failure"]["masking"] is None
     assert len(body["symlink_chain"]) >= 2
     assert "环" in body["failure"]["message"]
+
+
+def test_diagnose_symlink_into_rebuilt_directory(client, sample_archive):
+    """符号链接展开后断在未补回的条目：响应格式不变，masking 指向最初遮蔽层。"""
+    body = _upload(client, sample_archive, "/etc/app/plugin-b-link").json()
+    assert body["status"] == "not_found"
+    assert body["resolved_path"] == "/etc/app/plugins/b.conf"
+    assert body["symlink_chain"][0] == {
+        "link_path": "/etc/app/plugin-b-link",
+        "target": "plugins/b.conf",
+        "layer_index": 2,
+        "digest": body["symlink_chain"][0]["digest"],
+        "mount_point": None,
+    }
+    failure = body["failure"]
+    assert failure["failed_component"] == "b.conf"
+    assert failure["resolved_prefix"] == "/etc/app/plugins"
+    assert failure["masking"]["reason"] == "whiteout"
+    assert failure["masking"]["layer_index"] == 1
+    assert failure["masking"]["digest"].startswith("sha256:")
+    assert failure["masking"]["diff_id"].startswith("sha256:")
+    assert failure["masking"]["opaque_directory"] is None
 
 
 def test_diagnose_with_mount(client, sample_archive):

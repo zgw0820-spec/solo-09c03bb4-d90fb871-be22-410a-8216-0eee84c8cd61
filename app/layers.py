@@ -8,6 +8,9 @@
 * whiteout/opaque 只遮下层，同一层里在遮蔽之后新建的条目照常可见；
 * 墓碑节点保留遮蔽来源（哪个层、哪种原因、opaque 时的父目录），
   供诊断 API 在路径断裂时给出可定位的信息；
+* 被遮蔽的目录会在墓碑上保留旧子树快照；同层或更高层重建该目录时，
+  未补回的下层条目以墓碑形式继承进新目录，仍能追溯到最初让它消失的标记；
+  已恢复的条目正常可见，若之后再次被遮蔽则改记新的遮蔽层；
 * 全程在内存里操作，归档内容不会落到宿主机文件系统上被执行。
 """
 
@@ -78,6 +81,11 @@ class Node:
     link_target: Optional[str] = None  # 符号链接目标（镜像内原始字符串）
     size: int = 0
     mask: Optional[Mask] = None  # 仅墓碑使用
+    # 仅墓碑使用：被遮蔽那一层的旧子树快照。目录在原位重建后，可据此继续解释
+    # “下层本来有、但重建层没有补回”的条目，而不是退化成普通缺失。
+    shadowed: Optional["Node"] = None
+    # 仅墓碑使用：该墓碑来自被遮蔽目录的旧子树，即目录已重建但该条目未补回
+    inherited_from_shadow: bool = False
     # 挂载点：被替换下来的旧子树根，用于解释“为什么挂载点下面的镜像文件没了”
     replaced: Optional["Node"] = None
 
@@ -96,11 +104,49 @@ def _is_safe_relpath(parts: list[str]) -> bool:
     return all(p != ".." and p != "/" for p in parts)
 
 
+def _shadow_snapshot(existing: Optional["Node"]) -> Optional["Node"]:
+    """墓碑要保留的旧子树。
+
+    只能是目录：目录被遮蔽后，其子树从合并视图中摘除且不再被任何后续层原地
+    修改（重建总是生成新节点），因此可直接引用而不必深拷贝。
+    """
+    if existing is None or existing.kind != NodeKind.DIRECTORY:
+        return None
+    return existing
+
+
+def _inherit_shadowed(new_dir: "Node", tombstone: "Node") -> None:
+    """目录在原位重建后，把重建层没有补回的下层条目以墓碑形式继承进来。
+
+    * 快照里本来就已经是墓碑的条目：保留它最初的遮蔽来源；
+    * 快照里仍存活的条目：是本次目录遮蔽让它消失的，记本次墓碑的标记与层。
+    """
+    snapshot = tombstone.shadowed
+    if snapshot is None:
+        return
+    for name, child in snapshot.children.items():
+        if child.kind == NodeKind.TOMBSTONE:
+            new_dir.children[name] = child
+        else:
+            assert tombstone.mask is not None
+            # 快照中的条目在遮蔽发生时仍可见，是本次目录遮蔽让它消失的：
+            # 记本次墓碑的标记与层（即让它在容器视图中消失的那一层）。
+            new_dir.children[name] = Node(
+                kind=NodeKind.TOMBSTONE,
+                source=tombstone.mask.source,
+                mask=tombstone.mask,
+                shadowed=child,
+                inherited_from_shadow=True,
+            )
+
+
 def _ensure_child_dir(parent: Node, name: str, source: Source) -> Node:
     """在 parent 下取到一个可用的目录节点；遇到墓碑或类型冲突则用新目录替换。"""
     existing = parent.children.get(name)
     if existing is None or existing.kind in (NodeKind.TOMBSTONE, NodeKind.FILE, NodeKind.SYMLINK):
         fresh = Node(kind=NodeKind.DIRECTORY, source=source)
+        if existing is not None and existing.kind == NodeKind.TOMBSTONE:
+            _inherit_shadowed(fresh, existing)
         parent.children[name] = fresh
         return fresh
     return existing
@@ -132,20 +178,16 @@ def _apply_whiteout(root: Node, parts: list[str], source: LayerSource) -> None:
         cursor = nxt
 
     existing = cursor.children.get(final)
-    if existing is None:
-        cursor.children[final] = Node(
-            kind=NodeKind.TOMBSTONE,
-            source=source,
-            mask=Mask(reason=MaskReason.WHITEOUT, source=source),
-        )
-    else:
-        # 同层可能先建后删，也可能删下层项：统一用带遮蔽来源的墓碑替换，
-        # 墓碑会被同层后续新增项再覆盖。
-        cursor.children[final] = Node(
-            kind=NodeKind.TOMBSTONE,
-            source=source,
-            mask=Mask(reason=MaskReason.WHITEOUT, source=source),
-        )
+    if existing is not None and existing.kind == NodeKind.TOMBSTONE:
+        # 该条目从未恢复过：保留最初的遮蔽来源，不因后续层的再次遮蔽而改记。
+        return
+    # 墓碑同时保存下层旧子树，便于目录重建后继续解释没补回的条目。
+    cursor.children[final] = Node(
+        kind=NodeKind.TOMBSTONE,
+        source=source,
+        mask=Mask(reason=MaskReason.WHITEOUT, source=source),
+        shadowed=_shadow_snapshot(existing),
+    )
 
 
 def _apply_opaque(root: Node, dir_parts: list[str], source: LayerSource) -> None:
@@ -159,10 +201,14 @@ def _apply_opaque(root: Node, dir_parts: list[str], source: LayerSource) -> None
 
     opaque_path = "/" + "/".join(dir_parts) if dir_parts else "/"
     for name, child in list(cursor.children.items()):
+        if child.kind == NodeKind.TOMBSTONE:
+            # 该条目早已被更早的标记遮蔽、从未恢复：保留最初的遮蔽来源。
+            continue
         cursor.children[name] = Node(
             kind=NodeKind.TOMBSTONE,
             source=source,
             mask=Mask(reason=MaskReason.OPAQUE, source=source, opaque_dir=opaque_path),
+            shadowed=_shadow_snapshot(child),
         )
 
 
@@ -181,7 +227,11 @@ def _apply_entry(root: Node, entry: _PendingEntry, source: LayerSource) -> None:
         existing = cursor.children.get(name)
         if existing is not None and existing.kind == NodeKind.DIRECTORY:
             return  # 目录合并且保留下层已有子项
-        cursor.children[name] = _new_dir(source)
+        fresh = _new_dir(source)
+        if existing is not None and existing.kind == NodeKind.TOMBSTONE:
+            # 目录被遮蔽后由更高层整目录重建：未补回的旧条目继续作为墓碑可见
+            _inherit_shadowed(fresh, existing)
+        cursor.children[name] = fresh
         return
 
     if member.issym():
